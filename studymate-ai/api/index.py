@@ -32,7 +32,7 @@ if len(SECRET) < 32:
 COOKIE_NAME = 'studymate_session'
 logging.basicConfig(level=os.getenv('LOG_LEVEL', 'INFO'))
 logger = logging.getLogger('studymate')
-MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash')
 
 app = FastAPI(title='StudyMate AI')
 
@@ -522,28 +522,46 @@ Use Markdown. Never invent facts or citations. If documents are supplied, distin
     async def events():
         collected = []
         try:
-            url = f'https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:streamGenerateContent?alt=sse'
+            models_to_try = [MODEL, 'gemini-2.0-flash', 'gemini-1.5-flash']
+            seen = set()
+            models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
+            stream_started = False
             async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=15)) as client:
-                async with client.stream('POST', url, headers={'x-goog-api-key': api_key}, json={'systemInstruction': {'parts': [{'text': system}]}, 'contents': contents, 'generationConfig': {'temperature': 0.6}}) as resp:
-                    if resp.status_code != 200:
-                        logger.warning('Gemini provider returned HTTP %s', resp.status_code)
-                        yield 'data: ' + json.dumps({'error': f'AI provider returned HTTP {resp.status_code}. Check your API key, model and quota.'}) + '\n\n'
-                        return
-                    async for line in resp.aiter_lines():
-                        if not line.startswith('data: '):
-                            continue
-                        try:
-                            obj = json.loads(line[6:])
-                            parts = obj.get('candidates', [{}])[0].get('content', {}).get('parts', [])
-                            chunk = ''.join(part.get('text', '') for part in parts)
-                            if chunk:
-                                collected.append(chunk)
-                                yield 'data: ' + json.dumps({'text': chunk}) + '\n\n'
-                        except (ValueError, IndexError, KeyError):
-                            continue
-        except Exception:
-            logger.exception('AI provider stream failed')
-            yield 'data: ' + json.dumps({'error': 'AI service temporarily unavailable. Please retry.'}) + '\n\n'
+                for mod in models_to_try:
+                    url = f'https://generativelanguage.googleapis.com/v1beta/models/{mod}:streamGenerateContent?alt=sse'
+                    async with client.stream('POST', url, headers={'x-goog-api-key': api_key}, json={'systemInstruction': {'parts': [{'text': system}]}, 'contents': contents, 'generationConfig': {'temperature': 0.6}}) as resp:
+                        if resp.status_code == 200:
+                            stream_started = True
+                            async for line in resp.aiter_lines():
+                                if not line.startswith('data: '):
+                                    continue
+                                try:
+                                    obj = json.loads(line[6:])
+                                    parts = obj.get('candidates', [{}])[0].get('content', {}).get('parts', [])
+                                    chunk = ''.join(part.get('text', '') for part in parts)
+                                    if chunk:
+                                        collected.append(chunk)
+                                        yield 'data: ' + json.dumps({'text': chunk}) + '\n\n'
+                                except (ValueError, IndexError, KeyError):
+                                    continue
+                            break
+                        else:
+                            raw_err = await resp.aread()
+                            err_text = raw_err.decode('utf-8', errors='ignore')
+                            logger.warning('Model %s failed with status %s: %s', mod, resp.status_code, err_text)
+                            if resp.status_code in (404, 400) and mod != models_to_try[-1]:
+                                continue
+                            google_msg = ''
+                            try:
+                                google_msg = json.loads(err_text).get('error', {}).get('message', '')
+                            except Exception:
+                                pass
+                            err_out = google_msg or f'Google Gemini error (HTTP {resp.status_code})'
+                            yield 'data: ' + json.dumps({'error': err_out}) + '\n\n'
+                            return
+        except Exception as ex:
+            logger.exception('AI provider stream failed: %s', ex)
+            yield 'data: ' + json.dumps({'error': f'AI service error: {str(ex)}'}) + '\n\n'
         finally:
             if collected:
                 try:
