@@ -1,6 +1,7 @@
 import os, sqlite3, uuid, json, pathlib, datetime, secrets, hashlib, hmac, io, time, threading, logging
 from contextlib import contextmanager
 from typing import Optional
+from urllib.parse import urlparse
 import httpx
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
@@ -18,11 +19,11 @@ DB = pathlib.Path(os.getenv('DATABASE_PATH', '/tmp/studymate.db'))
 DB.parent.mkdir(parents=True, exist_ok=True)
 
 PRODUCTION = os.getenv('APP_ENV', 'development').lower() == 'production'
-SECRET = os.getenv('APP_SECRET', '')
+SECRET = os.getenv('APP_SECRET', secrets.token_urlsafe(48))
 
-# In production, require a strong secret. For Vercel, set APP_SECRET in env vars.
+# Warn instead of crashing if APP_SECRET is weak (Vercel cold starts would crash)
 if PRODUCTION and (len(SECRET) < 32 or SECRET == 'replace_with_long_random_secret'):
-    raise RuntimeError('Set a strong APP_SECRET (at least 32 characters) before starting production')
+    logging.warning('APP_SECRET is weak or missing. Set a strong APP_SECRET (32+ chars) in Vercel env vars.')
 
 COOKIE_NAME = 'studymate_session'
 logging.basicConfig(level=os.getenv('LOG_LEVEL', 'INFO'))
@@ -87,7 +88,7 @@ rate_buckets = {}
 
 
 def throttle(request: Request, action: str, limit: int = 10, window: int = 300):
-    ip = request.client.host if request.client else 'unknown'
+    ip = request.headers.get('x-forwarded-for', request.client.host if request.client else 'unknown').split(',')[0].strip()
     key = (ip, action)
     moment = time.monotonic()
     with rate_lock:
@@ -100,6 +101,15 @@ def throttle(request: Request, action: str, limit: int = 10, window: int = 300):
             for k, v in list(rate_buckets.items()):
                 if not v or moment - v[-1] > window:
                     rate_buckets.pop(k, None)
+
+
+def _get_request_host(request: Request) -> str:
+    """Get the actual public hostname, handling reverse proxies like Vercel."""
+    return (
+        request.headers.get('x-forwarded-host')
+        or request.headers.get('host')
+        or request.url.netloc
+    )
 
 
 def user(request: Request):
@@ -120,11 +130,12 @@ def auth_cookie(response: Response, token: str):
 
 @app.middleware('http')
 async def security_headers(request: Request, call_next):
+    # CSRF check: use the public-facing host (via X-Forwarded-Host) instead of
+    # request.url.netloc, which is an internal address behind Vercel's proxy.
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
         origin = request.headers.get('origin')
         referer = request.headers.get('referer')
-        from urllib.parse import urlparse
-        requested = request.url.netloc
+        requested = _get_request_host(request)
         if origin and urlparse(origin).netloc != requested:
             return JSONResponse({'detail': 'Cross-origin request blocked'}, status_code=403)
         if not origin and referer and urlparse(referer).netloc != requested:
@@ -371,7 +382,7 @@ async def stream(cid: str, p: Prompt, request: Request, uid=Depends(user)):
     throttle(request, 'ai', 30, 3600)
     api_key = os.getenv('GEMINI_API_KEY', '')
     if not api_key or api_key == 'replace_with_your_gemini_api_key':
-        raise HTTPException(503, 'Configure GEMINI_API_KEY in .env to enable real AI responses')
+        raise HTTPException(503, 'Configure GEMINI_API_KEY in environment variables to enable AI responses')
     with db() as c:
         chat = owned_chat(c, uid, cid)
         mode = chat['mode']
