@@ -188,6 +188,7 @@ class Auth(BaseModel):
 
 
 class Settings(BaseModel):
+    api_key: str = ''
     language: str = 'English'
     length: str = 'Detailed'
     difficulty: str = 'Beginner'
@@ -464,9 +465,20 @@ MODES = {
 
 @api_router.post('/chats/{cid}/stream')
 async def stream(cid: str, p: Prompt, request: Request, uid=Depends(user)):
-    api_key = os.getenv('GEMINI_API_KEY', '')
+    api_key = request.headers.get('x-gemini-api-key', '').strip()
+    if not api_key:
+        api_key = os.getenv('GEMINI_API_KEY', '').strip()
     if not api_key or api_key == 'replace_with_your_gemini_api_key':
-        raise HTTPException(503, 'Configure GEMINI_API_KEY in environment variables to enable AI responses')
+        try:
+            with db() as c:
+                row = c.execute('SELECT settings FROM users WHERE id=?', (uid,)).fetchone()
+                if row and row['settings']:
+                    api_key = json.loads(row['settings']).get('api_key', '').strip()
+        except Exception:
+            pass
+
+    if not api_key or api_key == 'replace_with_your_gemini_api_key':
+        raise HTTPException(503, 'Gemini API key is required. Add GEMINI_API_KEY in Vercel Environment Variables, or enter it in Settings.')
 
     mode = 'chat'
     settings = {}
