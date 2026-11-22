@@ -142,24 +142,28 @@ def _get_request_host(request: Request) -> str:
 
 
 def user(request: Request) -> str:
+    # If cookie is present and valid, use it
     token = request.cookies.get(COOKIE_NAME)
-    if not token:
-        raise HTTPException(401, 'Please sign in')
+    if token:
+        info = verify_token(token)
+        if info:
+            uid = info['uid']
+            email = info['email']
+            with db() as c:
+                u = c.execute('SELECT id FROM users WHERE id=?', (uid,)).fetchone()
+                if not u:
+                    c.execute('INSERT OR IGNORE INTO users VALUES(?,?,?,?,?,?)',
+                              (uid, email or f"user_{uid[:8]}@example.com", "", "", now(), Settings().model_dump_json()))
+            return uid
 
-    info = verify_token(token)
-    if not info:
-        raise HTTPException(401, 'Session expired or invalid')
-
-    uid = info['uid']
-    email = info['email']
-
-    # Auto-ensure user exists in this specific container's DB if cold-started
+    # Seamless access: default user so the workspace works directly without a login gate
+    guest_uid = "default_guest_user"
     with db() as c:
-        u = c.execute('SELECT id FROM users WHERE id=?', (uid,)).fetchone()
+        u = c.execute('SELECT id FROM users WHERE id=?', (guest_uid,)).fetchone()
         if not u:
             c.execute('INSERT OR IGNORE INTO users VALUES(?,?,?,?,?,?)',
-                      (uid, email or f"user_{uid[:8]}@example.com", "", "", now(), Settings().model_dump_json()))
-    return uid
+                      (guest_uid, "guest@studymate.ai", "", "", now(), Settings().model_dump_json()))
+    return guest_uid
 
 
 def auth_cookie(response: Response, token: str):
