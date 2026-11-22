@@ -233,10 +233,10 @@ class GoalUpdate(BaseModel):
 
 @app.get('/')
 def home():
-    index_file = ROOT / 'static' / 'index.html'
-    if not index_file.exists():
-        index_file = ROOT / 'index.html'
-    return FileResponse(index_file)
+    for candidate in [ROOT / 'public' / 'index.html', ROOT / 'static' / 'index.html', ROOT / 'index.html']:
+        if candidate.exists():
+            return FileResponse(candidate)
+    return JSONResponse({'error': 'index.html not found'}, status_code=404)
 
 
 @app.post('/api/register')
